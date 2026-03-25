@@ -1,0 +1,38 @@
+# Video files (too large for git)
+*.mp4
+*.avi
+*.wmv
+
+# Data directories
+Tongue_mnd/
+Tongue_nml/
+
+# Output CSVs (generated, not source)
+*_detections*.csv
+*_summary.csv
+*_matches.csv
+detections_*.csv
+
+# macOS metadata
+._*
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
