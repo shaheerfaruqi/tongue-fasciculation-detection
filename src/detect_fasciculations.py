@@ -50,9 +50,9 @@ ARROW_COLOR = (0, 255, 0)
 
 # Detection geometry
 BORDER_FRAC = 0.10
-MIN_BLOB_AREA = 7
-ROI_MIN_BLOB_AREA = 7
-MAX_BLOB_FRAC = 0.05
+MIN_BLOB_AREA = 15
+ROI_MIN_BLOB_AREA = 12
+MAX_BLOB_FRAC = 0.03
 
 # ROI definition (bottom half by default)
 ROI_Y_FRAC_START = 0.5
@@ -76,26 +76,26 @@ FARNE_PARAMS = dict(
 )
 
 # Adaptive thresholding (robust)
-K_NONROI = 5.0
-K_ROI = 5.0
+K_NONROI = 8.0
+K_ROI = 7.0
 
 # Direction criterion
 USE_COHERENCE = True
-COHERENCE_MIN = 0.20
+COHERENCE_MIN = 0.50
 INCOHERENCE_MIN = 0.11
 
 # Morphology
 MORPH_KSIZE = 3
 
 # Temporal integration (pixel-wise)
-WINDOW_SEC_DEFAULT = 0.6
+WINDOW_SEC_DEFAULT = 1.0
 MIN_HITS_DEFAULT = 3
 
 # Optional: object confirmation 2-of-3 frames
 USE_OBJECT_CONFIRM_DEFAULT = True
-OBJECT_CONFIRM_K = 2
-OBJECT_CONFIRM_WINDOW = 3
-OBJECT_CONFIRM_DIST_PX = 20
+OBJECT_CONFIRM_K = 3
+OBJECT_CONFIRM_WINDOW = 5
+OBJECT_CONFIRM_DIST_PX = 25
 
 # Artifact rejection
 FOCUS_DROP_RATIO_DEFAULT = 0.65
@@ -109,6 +109,9 @@ SKIP_TAIL_FRAMES_DEFAULT = 5
 
 # Output FPS override (0 = auto/clamped)
 FPS_OUT_DEFAULT = 0.0
+
+# Minimum mean flow magnitude for a detected blob (rejects near-zero residual motion)
+MIN_MEAN_MAG_DEFAULT = 0.10
 
 
 # ======================
@@ -307,6 +310,7 @@ def run(
     skip_head: int,
     skip_tail: int,
     fps_out: float,
+    min_mean_mag: float,
 ):
     cap = cv2.VideoCapture(str(video_path))
     fps_in = clamp_fps(float(cap.get(cv2.CAP_PROP_FPS) or 0.0))
@@ -525,6 +529,11 @@ def run(
                     x, y, w, h = cv2.boundingRect(cnt)
                     patch_mag = mag_map[y:y+h, x:x+w]
                     mean_mag = float(patch_mag.mean()) if patch_mag.size else 0.0
+
+                    # Reject blobs with negligible actual flow magnitude
+                    if mean_mag < min_mean_mag:
+                        continue
+
                     patch_hits = hit_map[y:y+h, x:x+w]
                     mean_hits = float(patch_hits.mean()) if patch_hits.size else float(eff_min_hits)
 
@@ -669,6 +678,8 @@ def main():
                         help="Output FPS. 0 = use input FPS (clamped).")
 
     parser.add_argument("--disable_object_confirm", action="store_true")
+    parser.add_argument("--min_mean_mag", type=float, default=MIN_MEAN_MAG_DEFAULT,
+                        help="Minimum mean flow magnitude for a blob to count as a detection.")
 
     args = parser.parse_args()
 
@@ -702,6 +713,7 @@ def main():
         skip_head=args.skip_head,
         skip_tail=args.skip_tail,
         fps_out=args.fps_out,
+        min_mean_mag=args.min_mean_mag,
     )
 
 if __name__ == "__main__":

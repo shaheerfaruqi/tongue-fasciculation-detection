@@ -30,16 +30,16 @@ from collections import defaultdict, deque
 
 # ---------- Utilities ----------
 
-def draw_hud(frame, text_lines, y0=22):
-    overlay = frame.copy()
-    alpha = 0.7
-    bar_h = 26 * len(text_lines) + 10
-    cv2.rectangle(overlay, (0, 0), (frame.shape[1], bar_h), (0, 0, 0), -1)
-    frame[:] = cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0)
+def draw_hud_bar(frame_width, text_lines, y0=22):
+    """Create a separate HUD bar image (not drawn on the video frame)."""
+    line_step = 26
+    bar_h = max(y0 + line_step * len(text_lines) + 10, 30)
+    bar = np.zeros((bar_h, frame_width, 3), dtype=np.uint8)
     y = y0
     for line in text_lines:
-        cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
-        y += 26
+        cv2.putText(bar, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2, cv2.LINE_AA)
+        y += line_step
+    return bar
 
 def load_annotations(csv_path):
     if (csv_path is None) or (not os.path.exists(csv_path)):
@@ -96,6 +96,7 @@ class Annotator:
             self.total_frames = max(1, self.total_frames)
 
         self.curr_frame_idx = 0
+        self.frame_height = 0  # set after first frame read, used for mouse filtering
         self.playing = False
 
         self.window = "Fasciculation Annotator"
@@ -112,10 +113,16 @@ class Annotator:
         self.undo_stack = defaultdict(lambda: deque())  # per-frame undo
 
         # Preload first frame to initialize UI
-        _ = self._read_frame(self.curr_frame_idx)
+        self.last_frame = None  # keep last valid frame for boundary recovery
+        f = self._read_frame(self.curr_frame_idx)
+        if f is not None:
+            self.last_frame = f
 
     def on_mouse(self, event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
+            # Ignore clicks on the HUD bar below the video
+            if self.frame_height > 0 and y >= self.frame_height:
+                return
             p = {"x": int(x), "y": int(y), "note": ""}
             self.ann[self.curr_frame_idx].append(p)
             self.undo_stack[self.curr_frame_idx].append(("add", p))
@@ -132,6 +139,8 @@ class Annotator:
             if not ok or frame is None:
                 return None
         self.curr_frame_idx = idx
+        self.frame_height = frame.shape[0]
+        self.last_frame = frame  # always save last good frame
         # Optional: show index in window title
         try:
             cv2.setWindowTitle(self.window, f"{self.window} — Frame {self.curr_frame_idx+1}/{self.total_frames}")
@@ -147,15 +156,17 @@ class Annotator:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1, cv2.LINE_AA)
 
     def _hud(self, frame):
+        """Build HUD bar and stack it below the video frame."""
         t = self.curr_frame_idx / self.fps if self.fps else 0.0
         lines = [
             f"Video: {os.path.basename(self.video_path)}",
             f"Frame {self.curr_frame_idx+1}/{self.total_frames} | Time {t:.3f}s | FPS {self.fps:.3f}",
-            "Controls: [Space]=Play/Pause  [←/→]=Step  [,/.]=±10  Click=Add point",
+            "Controls: [Space]=Play/Pause  [<-/->]=Step  [,/.]=+-10  Click=Add point",
             "           [d]=Undo  [c]=Clear frame  [n]=Note last point  [s]=Save  [q]=Save+Quit",
             f"Points on this frame: {len(self.ann.get(self.curr_frame_idx, []))}"
         ]
-        draw_hud(frame, lines)
+        hud_bar = draw_hud_bar(frame.shape[1], lines)
+        return np.vstack([frame, hud_bar])
 
     def _add_note_last_point(self):
         pts = self.ann.get(self.curr_frame_idx, [])
@@ -202,14 +213,23 @@ class Annotator:
 
             frame = self._read_frame(self.curr_frame_idx)
             if frame is None:
-                break
+                # Boundary read failure — use last valid frame instead of exiting
+                if self.last_frame is not None:
+                    frame = self.last_frame.copy()
+                    self.playing = False
+                    # Shrink total_frames so we don't keep hitting the bad frame
+                    if self.curr_frame_idx > 0:
+                        self.total_frames = self.curr_frame_idx
+                        self.curr_frame_idx = self.total_frames - 1
+                else:
+                    break  # truly no frames available
 
             # Draw current frame annotations + HUD
             pts = self.ann.get(self.curr_frame_idx, [])
             self._draw_points(frame, pts)
-            self._hud(frame)
+            canvas = self._hud(frame)
 
-            cv2.imshow(self.window, frame)
+            cv2.imshow(self.window, canvas)
             delay = int(1000 / self.fps) if (self.playing and self.fps > 0) else 0
 
             key = cv2.waitKeyEx(delay)
