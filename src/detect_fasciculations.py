@@ -76,7 +76,7 @@ FARNE_PARAMS = dict(
 )
 
 # Adaptive thresholding (robust)
-K_NONROI = 6.0
+K_NONROI = 7.0
 K_ROI = 7.0
 
 # Direction criterion
@@ -90,6 +90,10 @@ MORPH_KSIZE = 3
 # Temporal integration (pixel-wise)
 WINDOW_SEC_DEFAULT = 1.0
 MIN_HITS_DEFAULT = 3
+
+# Transient filtering (suppress persistent noise)
+LONG_WINDOW_SEC_DEFAULT = 4.0
+MAX_LONG_HITS_FRAC_DEFAULT = 0.25
 
 # Optional: object confirmation 2-of-3 frames
 USE_OBJECT_CONFIRM_DEFAULT = True
@@ -111,7 +115,7 @@ SKIP_TAIL_FRAMES_DEFAULT = 5
 FPS_OUT_DEFAULT = 0.0
 
 # Minimum mean flow magnitude for a detected blob (rejects near-zero residual motion)
-MIN_MEAN_MAG_DEFAULT = 0.10
+MIN_MEAN_MAG_DEFAULT = 0.50
 
 
 # ======================
@@ -311,6 +315,8 @@ def run(
     skip_tail: int,
     fps_out: float,
     min_mean_mag: float,
+    long_window_sec: float,
+    max_long_hits_frac: float,
 ):
     cap = cv2.VideoCapture(str(video_path))
     fps_in = clamp_fps(float(cap.get(cv2.CAP_PROP_FPS) or 0.0))
@@ -363,6 +369,12 @@ def run(
     deno_q: Deque[np.ndarray] = deque(maxlen=win_len)
     orig_hits = np.zeros((height, width), dtype=np.uint16)
     deno_hits = np.zeros((height, width), dtype=np.uint16)
+
+    win_len_long = max(1, int(round(long_window_sec * fps)))
+    orig_long_q: Deque[np.ndarray] = deque(maxlen=win_len_long)
+    deno_long_q: Deque[np.ndarray] = deque(maxlen=win_len_long)
+    orig_long_hits = np.zeros((height, width), dtype=np.uint16)
+    deno_long_hits = np.zeros((height, width), dtype=np.uint16)
 
     focus_hist: Deque[float] = deque(maxlen=FOCUS_MEDIAN_WINDOW)
     recent_objs: Deque[List[Tuple[float, float, str]]] = deque(maxlen=OBJECT_CONFIRM_WINDOW)
@@ -441,6 +453,8 @@ def run(
         # Update rolling hits
         update_rolling_hits(orig_q, orig_hits, raw_mask)
         update_rolling_hits(deno_q, deno_hits, stab_mask)
+        update_rolling_hits(orig_long_q, orig_long_hits, raw_mask)
+        update_rolling_hits(deno_long_q, deno_long_hits, stab_mask)
 
         eff_raw_win = max(1, len(orig_q))
         eff_stab_win = max(1, len(deno_q))
@@ -501,6 +515,8 @@ def run(
                 thr_roi: float,
                 eff_min_hits: int,
                 hit_map: np.ndarray,
+                hit_map_long: np.ndarray,
+                eff_long_win: int,
             ):
                 contours, _ = cv2.findContours(temporal_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 for cnt in contours:
@@ -537,12 +553,20 @@ def run(
                     patch_hits = hit_map[y:y+h, x:x+w]
                     mean_hits = float(patch_hits.mean()) if patch_hits.size else float(eff_min_hits)
 
+                    patch_long_hits = hit_map_long[y:y+h, x:x+w]
+                    mean_long_hits = float(patch_long_hits.mean()) if patch_long_hits.size else 0.0
+                    frac_long = (mean_long_hits / eff_long_win) if eff_long_win > 0 else 0.0
+
+                    # Reject chronically active noise locations
+                    if frac_long > max_long_hits_frac:
+                        continue
+
                     frame_objects.append((cx, cy, panel))
 
                     cv2.rectangle(disp, (x, y), (x + w, y + h), (0, 0, 255), 1)
                     cv2.putText(
                         disp,
-                        f"{panel} {region} hits~{mean_hits:.1f} coh~{coh:.2f}",
+                        f"{panel} {region} hits~{mean_hits:.1f} frac_long~{frac_long:.2f}",
                         (x, max(0, y - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.4,
@@ -562,6 +586,7 @@ def run(
                         "incoherence": incoh,
                         "mean_mag": mean_mag,
                         "mean_hits": mean_hits,
+                        "frac_long": float(frac_long),
                         "eff_min_hits": int(eff_min_hits),
                         "thr_nonroi": float(thr_nonroi),
                         "thr_roi": float(thr_roi),
@@ -572,10 +597,15 @@ def run(
                         "stab_method": stab.method,
                     })
 
+            eff_raw_long_win = max(1, len(orig_long_q))
+            eff_stab_long_win = max(1, len(deno_long_q))
+
             detect_on_temporal(raw_temporal, ang_r, mag_r, "orig", original_disp,
-                               thr_raw_nonroi, thr_raw_roi, eff_min_hits_raw, orig_hits)
+                               thr_raw_nonroi, thr_raw_roi, eff_min_hits_raw, orig_hits,
+                               orig_long_hits, eff_raw_long_win)
             detect_on_temporal(stab_temporal, ang_s, mag_s, "denoised", candidate_disp,
-                               thr_stab_nonroi, thr_stab_roi, eff_min_hits_stab, deno_hits)
+                               thr_stab_nonroi, thr_stab_roi, eff_min_hits_stab, deno_hits,
+                               deno_long_hits, eff_stab_long_win)
 
         # Object confirmation (only for objects detected)
         if use_object_confirm:
@@ -625,7 +655,7 @@ def run(
         cols = [
             "frame_idx", "x", "y", "panel", "region",
             "area", "coherence", "incoherence",
-            "mean_mag", "mean_hits", "eff_min_hits",
+            "mean_mag", "mean_hits", "frac_long", "eff_min_hits",
             "thr_nonroi", "thr_roi",
             "focus", "focus_med", "blur_artifact", "motion_spike",
             "stab_method", "confirmed_2of3"
@@ -680,6 +710,10 @@ def main():
     parser.add_argument("--disable_object_confirm", action="store_true")
     parser.add_argument("--min_mean_mag", type=float, default=MIN_MEAN_MAG_DEFAULT,
                         help="Minimum mean flow magnitude for a blob to count as a detection.")
+    parser.add_argument("--long_window_sec", type=float, default=LONG_WINDOW_SEC_DEFAULT,
+                        help="Window size in seconds tracking chronic noise.")
+    parser.add_argument("--max_long_hits_frac", type=float, default=MAX_LONG_HITS_FRAC_DEFAULT,
+                        help="Max fraction of active frames in long window before suppressing.")
 
     args = parser.parse_args()
 
@@ -714,6 +748,8 @@ def main():
         skip_tail=args.skip_tail,
         fps_out=args.fps_out,
         min_mean_mag=args.min_mean_mag,
+        long_window_sec=args.long_window_sec,
+        max_long_hits_frac=args.max_long_hits_frac,
     )
 
 if __name__ == "__main__":
