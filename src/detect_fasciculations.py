@@ -76,7 +76,7 @@ FARNE_PARAMS = dict(
 )
 
 # Adaptive thresholding (robust)
-K_NONROI = 8.0
+K_NONROI = 6.0
 K_ROI = 7.0
 
 # Direction criterion
