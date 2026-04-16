@@ -30,6 +30,7 @@ Outputs:
 """
 
 import argparse
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -115,7 +116,7 @@ SKIP_TAIL_FRAMES_DEFAULT = 5
 FPS_OUT_DEFAULT = 0.0
 
 # Minimum mean flow magnitude for a detected blob (rejects near-zero residual motion)
-MIN_MEAN_MAG_DEFAULT = 0.50
+MIN_MEAN_MAG_DEFAULT = 2
 
 
 # ======================
@@ -296,8 +297,6 @@ def update_rolling_hits(queue: Deque[np.ndarray], hit_sum: np.ndarray, new_mask_
 def run(
     video_path: Path,
     out_csv: Path,
-    out_video_combined: Optional[Path],
-    out_video_orig: Path,
     out_video_deno: Path,
     out_video_flow: Path,
     window_sec: float,
@@ -335,15 +334,9 @@ def run(
 
     # Writers
     fourcc = cv2.VideoWriter_fourcc(*"FFV1")
-    out_combined_w = cv2.VideoWriter(str(out_video_combined), fourcc, fps, (out_width, height)) if out_video_combined else None
-    out_orig_w = cv2.VideoWriter(str(out_video_orig), fourcc, fps, (width, height))
     out_deno_w = cv2.VideoWriter(str(out_video_deno), fourcc, fps, (width, height))
     out_flow_w = cv2.VideoWriter(str(out_video_flow), fourcc, fps, (width, height))
 
-    if out_combined_w is not None and (not out_combined_w.isOpened()):
-        raise RuntimeError("Failed to open combined VideoWriter (codec/container issue).")
-    if not out_orig_w.isOpened():
-        raise RuntimeError("Failed to open orig VideoWriter (codec/container issue).")
     if not out_deno_w.isOpened():
         raise RuntimeError("Failed to open deno VideoWriter (codec/container issue).")
     if not out_flow_w.isOpened():
@@ -356,24 +349,18 @@ def run(
     prev_gray_stab = prev_gray_raw.copy()
 
     k_med = ensure_odd(MEDIAN_BLUR_KSIZE)
-    prev_gray_raw_flow = cv2.medianBlur(prev_gray_raw, k_med)
-    prev_gray_stab_flow = prev_gray_raw_flow.copy()
+    prev_gray_stab_flow = cv2.medianBlur(prev_gray_raw, k_med)
 
-    prev_frame_raw_vis = prev_bgr.copy()
     prev_frame_stab_vis = prev_bgr.copy()
 
     win_len = max(1, int(round(window_sec * fps)))
     min_hits = max(1, int(min_hits))
 
-    orig_q: Deque[np.ndarray] = deque(maxlen=win_len)
     deno_q: Deque[np.ndarray] = deque(maxlen=win_len)
-    orig_hits = np.zeros((height, width), dtype=np.uint16)
     deno_hits = np.zeros((height, width), dtype=np.uint16)
 
     win_len_long = max(1, int(round(long_window_sec * fps)))
-    orig_long_q: Deque[np.ndarray] = deque(maxlen=win_len_long)
     deno_long_q: Deque[np.ndarray] = deque(maxlen=win_len_long)
-    orig_long_hits = np.zeros((height, width), dtype=np.uint16)
     deno_long_hits = np.zeros((height, width), dtype=np.uint16)
 
     focus_hist: Deque[float] = deque(maxlen=FOCUS_MEDIAN_WINDOW)
@@ -381,12 +368,19 @@ def run(
 
     detections: List[Dict] = []
     frame_idx = 0
+    t_start = time.time()
+    progress_step = max(1, total_frames // 10)
 
     while True:
         ret, frame_bgr = cap.read()
         if not ret:
             break
         frame_idx += 1
+
+        if frame_idx % progress_step == 0 or frame_idx == total_frames - 1:
+            elapsed = time.time() - t_start
+            pct = 100 * frame_idx / max(1, total_frames - 1)
+            print(f"  Processing: {frame_idx}/{total_frames-1} frames ({pct:.0f}%) — {elapsed:.1f}s elapsed")
 
         in_head = frame_idx <= int(skip_head)
         in_tail = (total_frames > 0) and (frame_idx > (total_frames - int(skip_tail)))
@@ -399,18 +393,11 @@ def run(
         frame_stab = stab.frame_stab
 
         # Denoising
-        gray_raw_d = cv2.medianBlur(gray_raw, k_med)
         gray_stab_d = cv2.medianBlur(gray_stab, k_med)
         if USE_BILATERAL:
-            gray_raw_d = cv2.bilateralFilter(gray_raw_d, BILATERAL_D, BILATERAL_SIGMA_COLOR, BILATERAL_SIGMA_SPACE)
             gray_stab_d = cv2.bilateralFilter(gray_stab_d, BILATERAL_D, BILATERAL_SIGMA_COLOR, BILATERAL_SIGMA_SPACE)
 
-        # Flow + residual
-        flow_raw = cv2.calcOpticalFlowFarneback(prev_gray_raw_flow, gray_raw_d, None, **FARNE_PARAMS)
-        fx_r = flow_raw[..., 0] - np.median(flow_raw[..., 0])
-        fy_r = flow_raw[..., 1] - np.median(flow_raw[..., 1])
-        mag_r, ang_r = cv2.cartToPolar(fx_r, fy_r)
-
+        # Flow + residual (denoised/stabilized only)
         flow_stab = cv2.calcOpticalFlowFarneback(prev_gray_stab_flow, gray_stab_d, None, **FARNE_PARAMS)
         fx_s = flow_stab[..., 0] - np.median(flow_stab[..., 0])
         fy_s = flow_stab[..., 1] - np.median(flow_stab[..., 1])
@@ -435,8 +422,6 @@ def run(
                 vals = mag[central_mask > 0]
             return robust_threshold(vals.astype(np.float32), k)
 
-        thr_raw_nonroi = region_thr(mag_r, nonroi_mask, k_nonroi)
-        thr_raw_roi = region_thr(mag_r, roi_mask, k_roi)
         thr_stab_nonroi = region_thr(mag_s, nonroi_mask, k_nonroi)
         thr_stab_roi = region_thr(mag_s, roi_mask, k_roi)
 
@@ -447,25 +432,18 @@ def run(
             mask_u8[nonroi | roi] = 255
             return apply_morph(mask_u8, MORPH_KSIZE)
 
-        raw_mask = build_motion_mask(mag_r, thr_raw_nonroi, thr_raw_roi)
         stab_mask = build_motion_mask(mag_s, thr_stab_nonroi, thr_stab_roi)
 
-        # Update rolling hits
-        update_rolling_hits(orig_q, orig_hits, raw_mask)
+        # Update rolling hits (denoised only)
         update_rolling_hits(deno_q, deno_hits, stab_mask)
-        update_rolling_hits(orig_long_q, orig_long_hits, raw_mask)
         update_rolling_hits(deno_long_q, deno_long_hits, stab_mask)
 
-        eff_raw_win = max(1, len(orig_q))
         eff_stab_win = max(1, len(deno_q))
-        eff_min_hits_raw = min(min_hits, eff_raw_win)
         eff_min_hits_stab = min(min_hits, eff_stab_win)
 
-        raw_temporal = (orig_hits >= eff_min_hits_raw).astype(np.uint8) * 255
         stab_temporal = (deno_hits >= eff_min_hits_stab).astype(np.uint8) * 255
 
         # Visualization frames
-        original_disp = prev_frame_raw_vis.copy()
         candidate_disp = prev_frame_stab_vis.copy()
 
         # ROI overlay
@@ -477,7 +455,7 @@ def run(
         x1_vis = width - margin_x
         y0_vis = max(y0_roi, margin_y)
         y1_vis = height - margin_y
-        for disp in (original_disp, candidate_disp):
+        for disp in (candidate_disp,):
             overlay = disp.copy()
             cv2.rectangle(overlay, (x0_vis, y0_vis), (x1_vis, y1_vis), roi_color, -1)
             disp[:] = cv2.addWeighted(overlay, roi_alpha, disp, 1 - roi_alpha, 0)
@@ -498,7 +476,7 @@ def run(
         if motion_spike:
             status.append("MOTION_SPIKE")
         if status:
-            for disp in (original_disp, candidate_disp, flow_vis):
+            for disp in (candidate_disp, flow_vis):
                 cv2.putText(disp, "ARTIFACT: " + ",".join(status), (10, 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)
 
@@ -597,12 +575,8 @@ def run(
                         "stab_method": stab.method,
                     })
 
-            eff_raw_long_win = max(1, len(orig_long_q))
             eff_stab_long_win = max(1, len(deno_long_q))
 
-            detect_on_temporal(raw_temporal, ang_r, mag_r, "orig", original_disp,
-                               thr_raw_nonroi, thr_raw_roi, eff_min_hits_raw, orig_hits,
-                               orig_long_hits, eff_raw_long_win)
             detect_on_temporal(stab_temporal, ang_s, mag_s, "denoised", candidate_disp,
                                thr_stab_nonroi, thr_stab_roi, eff_min_hits_stab, deno_hits,
                                deno_long_hits, eff_stab_long_win)
@@ -627,26 +601,17 @@ def run(
                 detections[i]["confirmed_2of3"] = confirmed.get(key, 0)
                 i -= 1
 
-        # Write videos (always full length)
-        if out_combined_w is not None:
-            combined = np.hstack([original_disp, candidate_disp, flow_vis])
-            out_combined_w.write(combined)
-        out_orig_w.write(original_disp)
+        # Write videos
         out_deno_w.write(candidate_disp)
         out_flow_w.write(flow_vis)
 
         # Advance
-        prev_gray_raw = gray_raw
         prev_gray_stab = gray_stab
-        prev_gray_raw_flow = gray_raw_d
         prev_gray_stab_flow = gray_stab_d
-        prev_frame_raw_vis = frame_bgr
         prev_frame_stab_vis = frame_stab
 
+    t_elapsed = time.time() - t_start
     cap.release()
-    if out_combined_w is not None:
-        out_combined_w.release()
-    out_orig_w.release()
     out_deno_w.release()
     out_flow_w.release()
 
@@ -664,10 +629,8 @@ def run(
         df = df[cols]
     df.to_csv(out_csv, index=False)
     print(f"fps_in={fps_in:.3f}, fps_out={fps:.3f}, total_frames={total_frames}")
+    print(f"Total processing time: {t_elapsed:.1f}s ({total_frames / max(t_elapsed, 0.01):.1f} frames/sec)")
     print(f"Saved detections CSV to: {out_csv}")
-    if out_video_combined:
-        print(f"Saved combined video to: {out_video_combined}")
-    print(f"Saved original-panel video to: {out_video_orig}")
     print(f"Saved denoised-panel video to: {out_video_deno}")
     print(f"Saved flow video to: {out_video_flow}")
 
@@ -677,14 +640,11 @@ def run(
 # ======================
 
 def main():
-    parser = argparse.ArgumentParser(description="Improved variance/flow fasciculation detector (no DL).")
+    parser = argparse.ArgumentParser(description="Optical-flow fasciculation detector for tongue ultrasound.")
     parser.add_argument("--video", type=Path, required=True)
-    parser.add_argument("--out_csv", type=Path, default=Path("detections_variance_improved.csv"))
-    parser.add_argument("--out_video_combined", type=Path, default=Path("variance_improved_combined.avi"))
-    parser.add_argument("--no_combined", action="store_true")
-    parser.add_argument("--out_video_orig", type=Path, default=Path("variance_improved_orig.avi"))
-    parser.add_argument("--out_video_deno", type=Path, default=Path("variance_improved_deno.avi"))
-    parser.add_argument("--out_video_flow", type=Path, default=Path("variance_improved_flow.avi"))
+    parser.add_argument("--out_csv", type=Path, default=Path("detections.csv"))
+    parser.add_argument("--out_video_deno", type=Path, default=Path("detection_denoised.avi"))
+    parser.add_argument("--out_video_flow", type=Path, default=Path("detection_flow.avi"))
 
     parser.add_argument("--window_sec", type=float, default=WINDOW_SEC_DEFAULT)
     parser.add_argument("--min_hits", type=int, default=MIN_HITS_DEFAULT)
@@ -729,8 +689,6 @@ def main():
     run(
         video_path=args.video,
         out_csv=args.out_csv,
-        out_video_combined=(None if args.no_combined else args.out_video_combined),
-        out_video_orig=args.out_video_orig,
         out_video_deno=args.out_video_deno,
         out_video_flow=args.out_video_flow,
         window_sec=args.window_sec,

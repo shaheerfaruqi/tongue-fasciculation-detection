@@ -1,38 +1,30 @@
-# Video files (too large for git)
-*.mp4
-*.avi
-*.wmv
-
-# Data directories
+# Data directories (large video collections)
 Tongue_mnd/
 Tongue_nml/
 
-# Output CSVs (generated, not source)
-*_detections*.csv
-*_summary.csv
-*_matches.csv
-detections_*.csv
+# Source videos (too large for git)
+*.mp4
+*.wmv
+*.avi
 
-# macOS metadata
-._*
-.DS_Store
+# Output CSVs (regenerable)
+*_detections*.csv
+*_comparison_*.csv
+*_summary*.csv
+*_matches*.csv
+
+# Keep manual annotations tracked
+!manual_annotations.csv
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
-*.egg-info/
-dist/
-build/
-.eggs/
 
-# Virtual environments
-venv/
-.venv/
-env/
+# macOS
+.DS_Store
+._*
 
 # IDE
 .vscode/
 .idea/
-*.swp
-*.swo
